@@ -1,0 +1,14 @@
+[package]
+name = "graphics_test"
+version = "0.1.0"
+authors = ["CensoredUsername <cens.username@gmail.com>"]
+
+[dependencies]
+gfx = "0.13.0"
+glutin = "0.7.2"
+gfx_window_glutin = "0.13.1"
+image = "0.12.1"
+cgmath = "0.12.0"
+
+[profile.release]
+lto = true
