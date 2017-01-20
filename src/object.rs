@@ -1,7 +1,3 @@
-
-use gfx::{Resources, Factory, Slice};
-use gfx::traits::FactoryExt;
-use gfx::handle::Buffer;
 use cgmath as m;
 use cgmath::{Rotation3, Transform, InnerSpace};
 use glutin::VirtualKeyCode;
@@ -31,7 +27,8 @@ impl<'a> UpdateState<'a> {
 
 #[derive(Debug)]
 pub struct RenderContext {
-    pub geometry: (Vec<Vertex>, Vec<u32>),
+    pub shaded_geometry: (Vec<Vertex>, Vec<u32>),
+    pub unshaded_geometry: (Vec<Vertex>, Vec<u32>),
     pub transform_stack: Vec<WorldPos>,
     pub cameras: HashMap<&'static str, (WorldPos, Camera)>
 }
@@ -39,7 +36,8 @@ pub struct RenderContext {
 impl RenderContext {
     pub fn new() -> RenderContext {
         RenderContext {
-            geometry: (Vec::new(), Vec::new()),
+            shaded_geometry: (Vec::new(), Vec::new()),
+            unshaded_geometry: (Vec::new(), Vec::new()),
             transform_stack: Vec::new(),
             cameras: HashMap::new(),
         }
@@ -57,22 +55,28 @@ impl RenderContext {
     }
 
     pub fn clear(&mut self) {
-        let (ref mut vertices, ref mut indices) = self.geometry;
+        let (ref mut vertices, ref mut indices) = self.shaded_geometry;
+        vertices.clear();
+        indices.clear();
+        let (ref mut vertices, ref mut indices) = self.unshaded_geometry;
         vertices.clear();
         indices.clear();
         self.cameras.clear()
     }
 
-    pub fn submit<F, R: Resources>(&mut self, factory: &mut F) -> (Buffer<R, Vertex>, Slice<R>) where F: Factory<R> {
-        let (ref vertices, ref indices) = self.geometry;
-        factory.create_vertex_buffer_with_slice(&vertices[..], &indices[..])
-    }
-
-    fn transform_pos(stack: &Vec<WorldPos>, pos: m::Point3<f32>) -> m::Point3<f32> {
+    fn transform_pos(stack: &[WorldPos], pos: m::Point3<f32>) -> m::Point3<f32> {
         if let Some(transform) = stack.last() {
             transform.transform_point(pos)
         } else {
             pos
+        }
+    }
+
+    fn transform_dir(stack: &[WorldPos], dir: m::Vector3<f32>) -> m::Vector3<f32> {
+        if let Some(transform) = stack.last() {
+            transform.transform_vector(dir)
+        } else {
+            dir
         }
     }
 
@@ -84,10 +88,8 @@ impl RenderContext {
         }
     }
 
-    pub fn add_mesh(&mut self, mesh: &Mesh<Vertex>) {
-        let (ref mut vertices, ref mut indices) = self.geometry;
-        let stack = &self.transform_stack;
-
+    pub fn add_vertices(mesh: &Mesh<Vertex>, geometry: &mut (Vec<Vertex>, Vec<u32>), stack: &[WorldPos]) {
+        let (ref mut vertices, ref mut indices) = *geometry;
         let current_offset = vertices.len() as u32;
         if !mesh.indices.is_empty() {
             indices.extend(mesh.indices.iter().cloned().map(|i| i + current_offset));
@@ -99,9 +101,18 @@ impl RenderContext {
         vertices.extend(
             mesh.vertices.iter().cloned().map(|mut vertex| {
                 vertex.pos = Self::transform_pos(stack, vertex.pos.into()).into();
+                vertex.normal = Self::transform_dir(stack, vertex.normal.into()).into();
                 vertex
             })
         );
+    }
+
+    pub fn add_mesh(&mut self, mesh: &Mesh<Vertex>) {
+        Self::add_vertices(mesh, &mut self.shaded_geometry, &self.transform_stack);
+    }
+
+    pub fn add_unshaded_mesh(&mut self, mesh: &Mesh<Vertex>) {
+        Self::add_vertices(mesh, &mut self.unshaded_geometry, &self.transform_stack);
     }
 
     pub fn set_camera(&mut self, camera: Camera) {
@@ -154,9 +165,12 @@ pub struct Item {
 pub enum ItemKind {
     Null,
     StaticMesh(Rc<Mesh<Vertex>>),
+    StaticUnshadedMesh(Rc<Mesh<Vertex>>),
     Subdomain(World),
     Animation(Box<FnMut(&mut WorldPos, &mut Item, &mut UpdateState)>, Box<Item>),
     Camera(Camera),
+    GlobalLight(m::Vector3<f32>, bool),
+    DirectionalLight(m::Vector3<f32>, m::Rad<f32>, m::Rad<f32>)
 }
 
 impl Item {
@@ -178,6 +192,13 @@ impl Item {
         Item {
             position: WorldPos::one(),
             kind: ItemKind::StaticMesh(mesh)
+        }
+    }
+
+    pub fn new_static_unshaded(mesh: Rc<Mesh<Vertex>>) -> Item {
+        Item {
+            position: WorldPos::one(),
+            kind: ItemKind::StaticUnshadedMesh(mesh)
         }
     }
 
@@ -224,7 +245,10 @@ impl Item {
                 item.update(state);
             },
             ItemKind::StaticMesh(_) => (),
+            ItemKind::StaticUnshadedMesh(_) => (),
             ItemKind::Camera(_) => (),
+            ItemKind::GlobalLight(_, _) => (),
+            ItemKind::DirectionalLight(_, _, _) => (),
             ItemKind::Null => ()
         }
     }
@@ -241,9 +265,18 @@ impl Item {
                 ItemKind::StaticMesh(ref mesh) => {
                     ctx.add_mesh(mesh);
                 },
+                ItemKind::StaticUnshadedMesh(ref mesh) => {
+                    ctx.add_unshaded_mesh(mesh);
+                },
                 ItemKind::Camera(ref camera) => {
                     ctx.set_camera(camera.clone());
-                }
+                },
+                ItemKind::GlobalLight(_, _) => {
+                    unimplemented!();
+                },
+                ItemKind::DirectionalLight(_, _, _) => {
+                    unimplemented!();
+                },
                 ItemKind::Null => ()
             }
         });

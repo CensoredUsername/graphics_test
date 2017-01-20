@@ -8,7 +8,7 @@ extern crate image;
 extern crate cgmath;
 
 use cgmath as m;
-use cgmath::{Zero, Rotation};
+use cgmath::{Rotation};
 
 use gfx::traits::Factory;
 use gfx::traits::FactoryExt;
@@ -26,18 +26,38 @@ mod object;
 
 gfx_defines!{
     vertex Vertex {
-        pos:   [f32; 3] = "vertex_Pos",
-        tex:   [f32; 2] = "vertex_TexPos",
+        pos:    [f32; 3] = "vertex_Pos",
+        normal: [f32; 3] = "vertex_normal",
+        tex:    [f32; 2] = "vertex_TexPos",
     }
 
-    pipeline pipe {
+    constant Material {
+        ambient:  [f32; 4] = "materials.ambient",
+        diffuse:  [f32; 4] = "materials.diffuse",
+        specular: [f32; 4] = "materials.specular",
+        shininess: f32     = "materials.shinines",
+    }
+
+    pipeline shaded_pipeline {
         // projection
         projection: gfx::Global<[[f32; 4]; 4]> = "projection",
         // globals
-        blend: gfx::Global<f32> = "blending",
+        material: gfx::ConstantBuffer<Material> = "materials",
+        lightcolor: gfx::Global<[f32; 3]> = "lightcolor",
+        lightpos: gfx::Global<[f32; 3]> = "lightpos",
+        viewpos: gfx::Global<[f32; 3]> = "viewpos",
         // textures
-        box_texture: gfx::TextureSampler<[f32; 4]> = "boxTexture",
-        face_texture: gfx::TextureSampler<[f32; 4]> = "faceTexture",
+        // in/output
+        vbuf: gfx::VertexBuffer<Vertex> = (),
+        out_color: gfx::RenderTarget<gfx::format::Rgba8> = "Target0",
+        out_depth: gfx::DepthTarget<gfx::format::DepthStencil> = gfx::preset::depth::LESS_EQUAL_WRITE,
+    }
+
+    pipeline unshaded_pipeline {
+        // projection
+        projection: gfx::Global<[[f32; 4]; 4]> = "projection",
+        // globals
+        // textures
         // in/output
         vbuf: gfx::VertexBuffer<Vertex> = (),
         out_color: gfx::RenderTarget<gfx::format::Rgba8> = "Target0",
@@ -46,44 +66,89 @@ gfx_defines!{
 }
 
 
-const VERTEX_SHADER: &'static [u8] = b"
-#version 330 core
+const SHADED_VERTEX_SHADER: &'static [u8] = b"
+    #version 330 core
 
-in vec3 vertex_Pos;
-in vec2 vertex_TexPos;
+    in vec3 vertex_Pos;
+    in vec3 vertex_normal;
+    in vec2 vertex_TexPos;
 
-uniform mat4 projection;
+    uniform mat4 projection;
 
-out vec2 TexPos;
-out vec4 pos;
+    out vec3 pos;
+    out vec3 normal;
 
-void main() {
-    TexPos = vertex_TexPos;
-
-    pos = projection * vec4(vertex_Pos.xyz, 1.0);
-    gl_Position = pos;
-}
+    void main() {
+        pos = vertex_Pos;
+        normal = vertex_normal;
+        gl_Position = projection * vec4(pos, 1.0);
+    }
 ";
 
-const PIXEL_SHADER: &'static [u8] = b"
-#version 330 core
+const SHADED_PIXEL_SHADER: &'static [u8] = b"
+    #version 330 core
 
-in vec4 pos;
-in vec2 TexPos;
+    layout(std140)
+    uniform materials {
+        vec4 ambient;
+        vec4 diffuse;
+        vec4 specular;
+        float shininess;
+    } material;
 
-out vec4 Target0;
+    in vec3 pos;
+    in vec3 normal;
 
-uniform float blending;
-uniform sampler2D boxTexture;
-uniform sampler2D faceTexture;
+    uniform vec3 lightcolor;
+    uniform vec3 lightpos;
+    uniform vec3 viewpos;
 
-void main() {
-    vec4 face = texture(faceTexture, vec2(TexPos.x, 1.0 - TexPos.y));
-    Target0 = mix(texture(boxTexture, TexPos).rgba, face.rgba, face.a * blending);
-}
+    out vec4 Target0;
+
+    void main() {
+        vec3 lightdir = normalize(lightpos - pos);
+        vec3 viewdir = normalize(viewpos - pos);
+        vec3 norm = normalize(normal);
+
+        vec3 ambient = material.ambient.rgb;
+
+        vec3 diffuse = max(0.0, dot(norm, lightdir)) * material.diffuse.rgb;
+
+        vec3 specular = material.specular.rgb * pow(max(0.0, dot(viewdir, reflect(-lightdir, norm))), material.shininess);
+
+        vec3 strength = ambient + diffuse + specular;
+        Target0 = pow(vec4(lightcolor * strength, 1.0), vec4(2.2));
+    }
 ";
 
-const CLEAR_COLOR: [f32; 4] = [0.1, 0.2, 0.3, 1.0];
+const UNSHADED_VERTEX_SHADER: &'static [u8] = b"
+    #version 330 core
+
+    in vec3 vertex_Pos;
+    in vec2 vertex_TexPos;
+
+    uniform mat4 projection;
+
+    out vec4 pos;
+
+    void main() {
+        pos = projection * vec4(vertex_Pos.xyz, 1.0);
+        gl_Position = pos;
+    }
+";
+
+const UNSHADED_PIXEL_SHADER: &'static [u8] = b"
+    #version 330 core
+
+    out vec4 Target0;
+
+    void main() {
+        Target0 = vec4(1.0);
+    }
+";
+
+
+const CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
 fn main() {
     if let Err(e) = main_loop() {
@@ -91,8 +156,8 @@ fn main() {
     }
 }
 
-fn load_texture<R, F, P>(factory: &mut F, path: P)
-               -> Result<gfx::handle::ShaderResourceView<R, [f32; 4]>, Box<Error>> where
+fn load_texture<R, F, P>(factory: &mut F, path: P) -> 
+               Result<gfx::handle::ShaderResourceView<R, [f32; 4]>, Box<Error>> where
                R: gfx::Resources, F: Factory<R>, P: AsRef<std::path::Path> {
     // loading resources
     let texture = image::open(path)?.to_rgba();
@@ -128,7 +193,7 @@ fn main_loop() -> Result<(), Box<Error>>{
 
     // get the window(framebuffers), device (thing that submits commandbuffers), factory(thing that gets resources into the GPU)
     // renderer output (in the given type) and depth mask output)
-    let (window, mut device, mut factory, render_target, depth_stencil) = 
+    let (window, mut device, mut factory, mut render_target, mut depth_stencil) = 
         gfx_window_glutin::init::<gfx::format::Rgba8, gfx::format::DepthStencil>(builder);
 
     // this cursor is mine
@@ -141,33 +206,33 @@ fn main_loop() -> Result<(), Box<Error>>{
     // create pipelines
 
     // compile shaders
-    let vertex_shader = factory.create_shader_vertex(VERTEX_SHADER)?;
-    let pixel_shader = factory.create_shader_pixel(PIXEL_SHADER)?;
-
-    // link the shaders together into a program
-    let program = factory.create_program(&gfx::ShaderSet::Simple(vertex_shader, pixel_shader))?;
+    let shaded_vertex_shader = factory.create_shader_vertex(SHADED_VERTEX_SHADER)?;
+    let shaded_pixel_shader = factory.create_shader_pixel(SHADED_PIXEL_SHADER)?;
+    let unshaded_vertex_shader = factory.create_shader_vertex(UNSHADED_VERTEX_SHADER)?;
+    let unshaded_pixel_shader = factory.create_shader_pixel(UNSHADED_PIXEL_SHADER)?;
 
     // simple rasterizes which rasterizes both the front and back face.
     let rasterizer = gfx::state::Rasterizer::new_fill();
-    //rasterizer.method = gfx::state::RasterMethod::Line(20);
 
-    // assemble the pipeline. note that the unwrap is because the return type of this function is rather retarded
-    let pso = factory.create_pipeline_from_program(&program, gfx::Primitive::TriangleList, rasterizer, pipe::new()).unwrap();
-    // frame information
+    // first pipeline
+    let program = factory.create_program(&gfx::ShaderSet::Simple(shaded_vertex_shader, shaded_pixel_shader))?;
+    let shaded_pso = factory.create_pipeline_from_program(&program, gfx::Primitive::TriangleList, rasterizer.clone(), shaded_pipeline::new()).map_err(gfx::PipelineStateError::<String>::from)?;
 
-
-
-    // create the actual input information for the GPU
-    // let box_tex  = load_texture(&mut factory, "images/container.jpg")?;
-    // let face_tex = load_texture(&mut factory, "images/awesomeface.png")?;
-
-    let box_tex  = load_texture_embedded(&mut factory, include_bytes!("../images/container.jpg"), image::ImageFormat::JPEG)?;
-    let face_tex = load_texture_embedded(&mut factory, include_bytes!("../images/awesomeface.png"), image::ImageFormat::PNG)?;
+    // second pipeline
+    let program = factory.create_program(&gfx::ShaderSet::Simple(unshaded_vertex_shader, unshaded_pixel_shader))?;
+    let unshaded_pso = factory.create_pipeline_from_program(&program, gfx::Primitive::TriangleList, rasterizer, unshaded_pipeline::new()).map_err(gfx::PipelineStateError::<String>::from)?;
 
     // sampler settings
-    let sampler = factory.create_sampler(gfx::texture::SamplerInfo::new(gfx::texture::FilterMethod::Scale, gfx::texture::WrapMode::Tile));
+    // let sampler = factory.create_sampler(gfx::texture::SamplerInfo::new(gfx::texture::FilterMethod::Scale, gfx::texture::WrapMode::Tile));
 
-
+    // materials
+    let material = factory.create_constant_buffer::<Material>(1);
+    encoder.update_constant_buffer(&material, &Material {
+        ambient: [0.1, 0.05, 0.031, 0.0],
+        diffuse: [1.0, 0.5, 0.31, 0.0],
+        specular: [0.5, 0.25, 0.0155, 0.0],
+        shininess: 32.0,
+    });
 
     // my own abstractions go here
 
@@ -270,23 +335,12 @@ fn main_loop() -> Result<(), Box<Error>>{
         );
     }
 
+    // add light
+    world.add_item(object::Item::new_static_unshaded(box_mesh)
+                                .at(1.2, 1.0, 2.0).scale(0.2));
+
     // rendering abstraction
     let mut renderer = object::RenderContext::new();
-
-    // create the vertex buffer
-    world.render(&mut renderer);
-    let (vertex_buffer, _) = renderer.submit(&mut factory);
-
-    // pipeline and global data
-    let mut data = pipe::Data {
-        projection: m::Matrix4::zero().into(),
-        blend: 0.0,
-        face_texture: (face_tex, sampler.clone()),
-        box_texture: (box_tex, sampler),
-        vbuf: vertex_buffer,
-        out_color: render_target,
-        out_depth: depth_stencil
-    };
 
 
     // main loop
@@ -301,7 +355,7 @@ fn main_loop() -> Result<(), Box<Error>>{
                 glutin::Event::Resized(new_width, new_height) => {
                     width = new_width;
                     height = new_height;
-                    gfx_window_glutin::update_views(&window, &mut data.out_color, &mut data.out_depth);
+                    gfx_window_glutin::update_views(&window, &mut render_target, &mut depth_stencil);
                 },
                 glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(keycode)) => {
                     keys_pressed.insert(keycode);
@@ -333,21 +387,35 @@ fn main_loop() -> Result<(), Box<Error>>{
         // rebuild the vertices
         renderer.clear();
         world.render(&mut renderer);
-        let (vertex_buffer, slice) = renderer.submit(&mut factory);
-        data.vbuf = vertex_buffer;
 
         // camera
-        data.projection = {
-            let &(ref camera_pos, ref camera) = renderer.cameras.get("cam1").unwrap();
-            camera.perspective * m::Matrix4::from(camera_pos.rot.invert()) * m::Matrix4::from_translation(-camera_pos.disp)
-        }.into();
+        let (ref camera_pos, ref camera) = *renderer.cameras.get("cam1").unwrap();
+        let projection = (camera.perspective * m::Matrix4::from(camera_pos.rot.invert()) * m::Matrix4::from_translation(-camera_pos.disp)).into();
 
 
         // clear the window
-        encoder.clear(&data.out_color, CLEAR_COLOR);
-        encoder.clear_depth(&data.out_depth, 1.0);
+        encoder.clear(&render_target, CLEAR_COLOR);
+        encoder.clear_depth(&depth_stencil, 1.0);
         // draw to the commandbuffer with the given vertex data, the pipeline and the input/output for the pipeline
-        encoder.draw(&slice, &pso, &data);
+        let (shaded_vertices, slice)   = factory.create_vertex_buffer_with_slice(&renderer.shaded_geometry.0, &renderer.shaded_geometry.1[..]);
+        encoder.draw(&slice, &shaded_pso, &shaded_pipeline::Data {
+            projection: projection,
+            material: material.clone(),
+            lightcolor: [1.0, 1.0, 1.0],
+            lightpos: [1.2, 1.0, 2.0],
+            viewpos: camera_pos.disp.into(),
+            vbuf: shaded_vertices,
+            out_color: render_target.clone(),
+            out_depth: depth_stencil.clone(),
+        });
+        // second draw
+        let (unshaded_vertices, slice) = factory.create_vertex_buffer_with_slice(&renderer.unshaded_geometry.0, &renderer.unshaded_geometry.1[..]);
+        encoder.draw(&slice, &unshaded_pso, &unshaded_pipeline::Data {
+            projection: projection,
+            vbuf: unshaded_vertices,
+            out_color: render_target.clone(),
+            out_depth: depth_stencil.clone(),
+        });
         // flush the command buffer to the GPU to actually do work
         encoder.flush(&mut device);
         // swap framebuffers
@@ -360,47 +428,47 @@ fn main_loop() -> Result<(), Box<Error>>{
 }
 
 const TRIANGLES: &'static [Vertex] = &[
-    Vertex {pos: [-0.5, -0.5, -0.5], tex: [0.0, 0.0] },
-    Vertex {pos: [ 0.5, -0.5, -0.5], tex: [1.0, 0.0] },
-    Vertex {pos: [ 0.5,  0.5, -0.5], tex: [1.0, 1.0] },
-    Vertex {pos: [ 0.5,  0.5, -0.5], tex: [1.0, 1.0] },
-    Vertex {pos: [-0.5,  0.5, -0.5], tex: [0.0, 1.0] },
-    Vertex {pos: [-0.5, -0.5, -0.5], tex: [0.0, 0.0] },
+    Vertex {pos: [-0.5, -0.5, -0.5], normal: [ 0.0,  0.0, -1.0], tex: [0.0, 0.0] },
+    Vertex {pos: [ 0.5, -0.5, -0.5], normal: [ 0.0,  0.0, -1.0], tex: [1.0, 0.0] },
+    Vertex {pos: [ 0.5,  0.5, -0.5], normal: [ 0.0,  0.0, -1.0], tex: [1.0, 1.0] },
+    Vertex {pos: [ 0.5,  0.5, -0.5], normal: [ 0.0,  0.0, -1.0], tex: [1.0, 1.0] },
+    Vertex {pos: [-0.5,  0.5, -0.5], normal: [ 0.0,  0.0, -1.0], tex: [0.0, 1.0] },
+    Vertex {pos: [-0.5, -0.5, -0.5], normal: [ 0.0,  0.0, -1.0], tex: [0.0, 0.0] },
 
-    Vertex {pos: [-0.5, -0.5,  0.5], tex: [0.0, 0.0] },
-    Vertex {pos: [ 0.5, -0.5,  0.5], tex: [1.0, 0.0] },
-    Vertex {pos: [ 0.5,  0.5,  0.5], tex: [1.0, 1.0] },
-    Vertex {pos: [ 0.5,  0.5,  0.5], tex: [1.0, 1.0] },
-    Vertex {pos: [-0.5,  0.5,  0.5], tex: [0.0, 1.0] },
-    Vertex {pos: [-0.5, -0.5,  0.5], tex: [0.0, 0.0] },
+    Vertex {pos: [-0.5, -0.5,  0.5], normal: [ 0.0,  0.0,  1.0], tex: [0.0, 0.0] },
+    Vertex {pos: [ 0.5, -0.5,  0.5], normal: [ 0.0,  0.0,  1.0], tex: [1.0, 0.0] },
+    Vertex {pos: [ 0.5,  0.5,  0.5], normal: [ 0.0,  0.0,  1.0], tex: [1.0, 1.0] },
+    Vertex {pos: [ 0.5,  0.5,  0.5], normal: [ 0.0,  0.0,  1.0], tex: [1.0, 1.0] },
+    Vertex {pos: [-0.5,  0.5,  0.5], normal: [ 0.0,  0.0,  1.0], tex: [0.0, 1.0] },
+    Vertex {pos: [-0.5, -0.5,  0.5], normal: [ 0.0,  0.0,  1.0], tex: [0.0, 0.0] },
 
-    Vertex {pos: [-0.5,  0.5,  0.5], tex: [1.0, 0.0] },
-    Vertex {pos: [-0.5,  0.5, -0.5], tex: [1.0, 1.0] },
-    Vertex {pos: [-0.5, -0.5, -0.5], tex: [0.0, 1.0] },
-    Vertex {pos: [-0.5, -0.5, -0.5], tex: [0.0, 1.0] },
-    Vertex {pos: [-0.5, -0.5,  0.5], tex: [0.0, 0.0] },
-    Vertex {pos: [-0.5,  0.5,  0.5], tex: [1.0, 0.0] },
+    Vertex {pos: [-0.5,  0.5,  0.5], normal: [-1.0,  0.0,  0.0], tex: [1.0, 0.0] },
+    Vertex {pos: [-0.5,  0.5, -0.5], normal: [-1.0,  0.0,  0.0], tex: [1.0, 1.0] },
+    Vertex {pos: [-0.5, -0.5, -0.5], normal: [-1.0,  0.0,  0.0], tex: [0.0, 1.0] },
+    Vertex {pos: [-0.5, -0.5, -0.5], normal: [-1.0,  0.0,  0.0], tex: [0.0, 1.0] },
+    Vertex {pos: [-0.5, -0.5,  0.5], normal: [-1.0,  0.0,  0.0], tex: [0.0, 0.0] },
+    Vertex {pos: [-0.5,  0.5,  0.5], normal: [-1.0,  0.0,  0.0], tex: [1.0, 0.0] },
 
-    Vertex {pos: [ 0.5,  0.5,  0.5], tex: [1.0, 0.0] },
-    Vertex {pos: [ 0.5,  0.5, -0.5], tex: [1.0, 1.0] },
-    Vertex {pos: [ 0.5, -0.5, -0.5], tex: [0.0, 1.0] },
-    Vertex {pos: [ 0.5, -0.5, -0.5], tex: [0.0, 1.0] },
-    Vertex {pos: [ 0.5, -0.5,  0.5], tex: [0.0, 0.0] },
-    Vertex {pos: [ 0.5,  0.5,  0.5], tex: [1.0, 0.0] },
+    Vertex {pos: [ 0.5,  0.5,  0.5], normal: [ 1.0,  0.0,  0.0], tex: [1.0, 0.0] },
+    Vertex {pos: [ 0.5,  0.5, -0.5], normal: [ 1.0,  0.0,  0.0], tex: [1.0, 1.0] },
+    Vertex {pos: [ 0.5, -0.5, -0.5], normal: [ 1.0,  0.0,  0.0], tex: [0.0, 1.0] },
+    Vertex {pos: [ 0.5, -0.5, -0.5], normal: [ 1.0,  0.0,  0.0], tex: [0.0, 1.0] },
+    Vertex {pos: [ 0.5, -0.5,  0.5], normal: [ 1.0,  0.0,  0.0], tex: [0.0, 0.0] },
+    Vertex {pos: [ 0.5,  0.5,  0.5], normal: [ 1.0,  0.0,  0.0], tex: [1.0, 0.0] },
 
-    Vertex {pos: [-0.5, -0.5, -0.5], tex: [0.0, 1.0] },
-    Vertex {pos: [ 0.5, -0.5, -0.5], tex: [1.0, 1.0] },
-    Vertex {pos: [ 0.5, -0.5,  0.5], tex: [1.0, 0.0] },
-    Vertex {pos: [ 0.5, -0.5,  0.5], tex: [1.0, 0.0] },
-    Vertex {pos: [-0.5, -0.5,  0.5], tex: [0.0, 0.0] },
-    Vertex {pos: [-0.5, -0.5, -0.5], tex: [0.0, 1.0] },
+    Vertex {pos: [-0.5, -0.5, -0.5], normal: [ 0.0, -1.0,  0.0], tex: [0.0, 1.0] },
+    Vertex {pos: [ 0.5, -0.5, -0.5], normal: [ 0.0, -1.0,  0.0], tex: [1.0, 1.0] },
+    Vertex {pos: [ 0.5, -0.5,  0.5], normal: [ 0.0, -1.0,  0.0], tex: [1.0, 0.0] },
+    Vertex {pos: [ 0.5, -0.5,  0.5], normal: [ 0.0, -1.0,  0.0], tex: [1.0, 0.0] },
+    Vertex {pos: [-0.5, -0.5,  0.5], normal: [ 0.0, -1.0,  0.0], tex: [0.0, 0.0] },
+    Vertex {pos: [-0.5, -0.5, -0.5], normal: [ 0.0, -1.0,  0.0], tex: [0.0, 1.0] },
 
-    Vertex {pos: [-0.5,  0.5, -0.5], tex: [0.0, 1.0] },
-    Vertex {pos: [ 0.5,  0.5, -0.5], tex: [1.0, 1.0] },
-    Vertex {pos: [ 0.5,  0.5,  0.5], tex: [1.0, 0.0] },
-    Vertex {pos: [ 0.5,  0.5,  0.5], tex: [1.0, 0.0] },
-    Vertex {pos: [-0.5,  0.5,  0.5], tex: [0.0, 0.0] },
-    Vertex {pos: [-0.5,  0.5, -0.5], tex: [0.0, 1.0] },
+    Vertex {pos: [-0.5,  0.5, -0.5], normal: [ 0.0,  1.0,  0.0], tex: [0.0, 1.0] },
+    Vertex {pos: [ 0.5,  0.5, -0.5], normal: [ 0.0,  1.0,  0.0], tex: [1.0, 1.0] },
+    Vertex {pos: [ 0.5,  0.5,  0.5], normal: [ 0.0,  1.0,  0.0], tex: [1.0, 0.0] },
+    Vertex {pos: [ 0.5,  0.5,  0.5], normal: [ 0.0,  1.0,  0.0], tex: [1.0, 0.0] },
+    Vertex {pos: [-0.5,  0.5,  0.5], normal: [ 0.0,  1.0,  0.0], tex: [0.0, 0.0] },
+    Vertex {pos: [-0.5,  0.5, -0.5], normal: [ 0.0,  1.0,  0.0], tex: [0.0, 1.0] },
 ];
 
 const CUBEPOSITIONS: &'static [m::Point3<f32>] = &[
