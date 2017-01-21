@@ -6,6 +6,7 @@ extern crate gfx_window_glutin;
 extern crate glutin;
 extern crate image;
 extern crate cgmath;
+extern crate env_logger;
 
 use cgmath as m;
 use cgmath::{Rotation};
@@ -31,20 +32,49 @@ gfx_defines!{
         tex:    [f32; 2] = "vertex_TexPos",
     }
 
-    constant Material {
-        ambient:  [f32; 4] = "materials.ambient",
-        diffuse:  [f32; 4] = "materials.diffuse",
-        specular: [f32; 4] = "materials.specular",
-        shininess: f32     = "materials.shinines",
+    constant DirectionalLight {
+        direction: [f32; 4] = "direction",
+        ambient:   [f32; 4] = "ambient",
+        diffuse:   [f32; 4] = "diffuse",
+        specular:  [f32; 4] = "specular",
+    }
+
+    constant PointLight {
+        position: [f32; 4] = "pos",
+        ambient:  [f32; 4] = "ambient",
+        diffuse:  [f32; 4] = "diffuse",
+        specular: [f32; 4] = "specular",
+        falloff:  [f32; 4] = "falloff",
+    }
+
+    constant SpotLight {
+        position: [f32; 4] = "pos",
+        direction:[f32; 4] = "direction",
+        ambient:  [f32; 4] = "ambient",
+        diffuse:  [f32; 4] = "diffuse",
+        specular: [f32; 4] = "specular",
+        falloff:  [f32; 4] = "falloff",
+        cone:     [f32; 4] = "cone",
     }
 
     pipeline shaded_pipeline {
         // projection
         projection: gfx::Global<[[f32; 4]; 4]> = "projection",
         // globals
-        material: gfx::ConstantBuffer<Material> = "materials",
-        lightcolor: gfx::Global<[f32; 3]> = "lightcolor",
-        lightpos: gfx::Global<[f32; 3]> = "lightpos",
+        material_diffuse:   gfx::TextureSampler<[f32; 4]> = "material.diffuse",
+        material_specular:  gfx::TextureSampler<[f32; 4]> = "material.specular",
+        material_shininess: gfx::Global<f32>              = "material.shininess",
+
+        // lighting stuff
+        light_directional_count: gfx::Global<i32>   = "directional_count",
+        light_point_count:       gfx::Global<i32>   = "point_count",
+        light_spot_count:        gfx::Global<i32>   = "spot_count",
+
+        light_directionals: gfx::ConstantBuffer<DirectionalLight> = "Directionals",
+        light_points:       gfx::ConstantBuffer<PointLight>       = "Points",
+        light_spots:        gfx::ConstantBuffer<SpotLight>        = "Spots",
+
+        // camera pos
         viewpos: gfx::Global<[f32; 3]> = "viewpos",
         // textures
         // in/output
@@ -77,8 +107,10 @@ const SHADED_VERTEX_SHADER: &'static [u8] = b"
 
     out vec3 pos;
     out vec3 normal;
+    out vec2 texpos;
 
     void main() {
+        texpos = vertex_TexPos;
         pos = vertex_Pos;
         normal = vertex_normal;
         gl_Position = projection * vec4(pos, 1.0);
@@ -88,36 +120,139 @@ const SHADED_VERTEX_SHADER: &'static [u8] = b"
 const SHADED_PIXEL_SHADER: &'static [u8] = b"
     #version 330 core
 
-    layout(std140)
-    uniform materials {
-        vec4 ambient;
-        vec4 diffuse;
-        vec4 specular;
-        float shininess;
-    } material;
+    const int MAX_NUM_LIGHTS = 16;
 
     in vec3 pos;
     in vec3 normal;
-
-    uniform vec3 lightcolor;
-    uniform vec3 lightpos;
+    in vec2 texpos;
     uniform vec3 viewpos;
+
+    struct Material {
+        sampler2D diffuse;
+        sampler2D specular;
+        float shininess;
+    };
+
+    uniform Material material;
+
+    struct DirectionalLight {
+        vec4 direction;
+        vec4 ambient;
+        vec4 diffuse;
+        vec4 specular;
+    };
+
+    struct PointLight {
+        vec4 pos;
+        vec4 ambient;
+        vec4 diffuse;
+        vec4 specular;
+        vec4 falloff;
+    };
+
+    struct SpotLight {
+        vec4 pos;
+        vec4 direction;
+        vec4 ambient;
+        vec4 diffuse;
+        vec4 specular;
+        vec4 falloff;
+        vec4 cone;
+    };
+
+    uniform int directional_count;
+    uniform int point_count;
+    uniform int spot_count;
+
+    layout(std140)
+    uniform Directionals {
+        DirectionalLight directionals[MAX_NUM_LIGHTS];
+    };
+
+    uniform Points {
+        PointLight       points[MAX_NUM_LIGHTS];
+    };
+
+    uniform Spots {
+        SpotLight        spots[MAX_NUM_LIGHTS];
+    };
 
     out vec4 Target0;
 
+    vec3 CalcDirectionalLight(DirectionalLight light, vec3 normal, vec3 viewdir) {
+        // vec3 tex_diffuse = texture(material.diffuse, texpos).rgb;
+        // vec3 tex_specular = texture(material.specular, texpos).rgb;
+        // vec3 lightdir = normalize(-light.direction.xyz);
+        // vec3 reflectdir = reflect(-lightdir, normal);
+
+        // vec3 ambient = tex_diffuse * light.ambient;
+        // vec3 diffuse = tex_diffuse * max(0.0, dot(normal, lightdir)) * light.diffuse.rgb;
+        // vec3 specular = tex_specular * pow(max(0.0, dot(viewdir, reflectdir)), material.shininess) * light.specular.rgb;
+
+        return vec3(1.0); // ambient + diffuse + specular;
+    }
+
+    vec3 CalcPointLight(PointLight light, vec3 normal, vec3 pos, vec3 viewdir) {
+        vec3 tex_diffuse  = texture(material.diffuse, texpos).rgb;
+        vec3 tex_specular = texture(material.specular, texpos).rgb;
+        vec3 lightdir     = normalize(light.pos.xyz - pos);
+        vec3 reflectdir   = reflect(-lightdir, normal);
+
+        vec3 ambient = tex_diffuse * light.ambient.rgb;
+        vec3 diffuse = tex_diffuse * max(0.0, dot(normal, lightdir)) * light.diffuse.rgb;
+        vec3 specular = tex_specular * pow(max(0.0, dot(viewdir, reflectdir)), material.shininess) * light.specular.rgb;
+
+        float distance = length(light.pos.xyz - pos);
+        float attenuation = 1.0 / (light.falloff.x + light.falloff.y * distance + light.falloff.z * (distance * distance));
+
+        return (ambient + diffuse + specular) * attenuation;
+    }
+
+    vec3 CalcSpotLight(SpotLight light, vec3 normal, vec3 pos, vec3 viewdir) {
+        vec3 tex_diffuse  = texture(material.diffuse, texpos).rgb;
+        vec3 tex_specular = texture(material.specular, texpos).rgb;
+        vec3 lightdir     = normalize(light.pos.xyz - pos);
+        vec3 reflectdir   = reflect(-lightdir, normal);
+
+        vec3 ambient = tex_diffuse * light.ambient.xyz;
+
+        float theta = dot(lightdir, normalize(-light.direction.xyz));
+        float distance = length(light.pos.xyz - pos);
+        float attenuation = 1.0 / (light.falloff.x + light.falloff.y * distance + light.falloff.z * (distance * distance));
+
+        if (theta < light.cone.y) {
+            return ambient * attenuation;
+
+        } else {
+            float epsilon = light.cone.x - light.cone.y;
+            float intensity = clamp((theta - light.cone.y) / epsilon, 0.0, 1.0);
+
+            vec3 diffuse = tex_diffuse * max(0.0, dot(normal, lightdir)) * light.diffuse.rgb;
+            vec3 specular = tex_specular * pow(max(0.0, dot(viewdir, reflectdir)), material.shininess) * light.specular.rgb;
+
+            vec3 spot = (diffuse + specular) * intensity + ambient; 
+
+            return spot * attenuation;
+
+        }
+    }
+
     void main() {
-        vec3 lightdir = normalize(lightpos - pos);
         vec3 viewdir = normalize(viewpos - pos);
         vec3 norm = normalize(normal);
 
-        vec3 ambient = material.ambient.rgb;
+        vec3 result = vec3(0.0);
+        for (int i = 0; i < directional_count; i++) {
+            result += CalcDirectionalLight(directionals[i], norm, viewdir);
+        }
+        for (int i = 0; i < point_count; i++) {
+            result += CalcPointLight(points[i], norm, pos, viewdir);
+        }
+        for (int i = 0; i < spot_count; i++) {
+            result += CalcSpotLight(spots[i], norm, pos, viewdir);
+        }
 
-        vec3 diffuse = max(0.0, dot(norm, lightdir)) * material.diffuse.rgb;
-
-        vec3 specular = material.specular.rgb * pow(max(0.0, dot(viewdir, reflect(-lightdir, norm))), material.shininess);
-
-        vec3 strength = ambient + diffuse + specular;
-        Target0 = pow(vec4(lightcolor * strength, 1.0), vec4(2.2));
+        Target0 = pow(vec4(result, 1.0), vec4(2.2));
     }
 ";
 
@@ -143,15 +278,17 @@ const UNSHADED_PIXEL_SHADER: &'static [u8] = b"
     out vec4 Target0;
 
     void main() {
-        Target0 = vec4(1.0);
+        Target0 = vec4(1.0, 0.2, 0.2, 1.0);
     }
 ";
 
 
-const CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+const CLEAR_COLOR: [f32; 4] = [0.01, 0.01, 0.01, 1.0];
 
 fn main() {
+    env_logger::init().unwrap();
     if let Err(e) = main_loop() {
+        println!("{:#?}", e);
         writeln!(&mut std::io::stderr(), "An exception occurred: {}", e).unwrap();
     }
 }
@@ -223,16 +360,9 @@ fn main_loop() -> Result<(), Box<Error>>{
     let unshaded_pso = factory.create_pipeline_from_program(&program, gfx::Primitive::TriangleList, rasterizer, unshaded_pipeline::new()).map_err(gfx::PipelineStateError::<String>::from)?;
 
     // sampler settings
-    // let sampler = factory.create_sampler(gfx::texture::SamplerInfo::new(gfx::texture::FilterMethod::Scale, gfx::texture::WrapMode::Tile));
-
-    // materials
-    let material = factory.create_constant_buffer::<Material>(1);
-    encoder.update_constant_buffer(&material, &Material {
-        ambient: [0.1, 0.05, 0.031, 0.0],
-        diffuse: [1.0, 0.5, 0.31, 0.0],
-        specular: [0.5, 0.25, 0.0155, 0.0],
-        shininess: 32.0,
-    });
+    let diffuse = load_texture(&mut factory, "images/container2.png")?;
+    let specular = load_texture(&mut factory, "images/container2_specular.png")?;
+    let sampler = factory.create_sampler(gfx::texture::SamplerInfo::new(gfx::texture::FilterMethod::Bilinear, gfx::texture::WrapMode::Tile));
 
     // my own abstractions go here
 
@@ -297,9 +427,26 @@ fn main_loop() -> Result<(), Box<Error>>{
                 world.add_item(object::Item::new_camera("cam1", m::perspective(
                     m::Deg(90.0), width as f32 / height as f32, 0.1, 100.0
                 )));
+                // world.add_item(
+                //     object::Item::new_static(box_mesh.clone())
+                //     .at(0.0, 0.0, -10.0)
+                // );
                 world.add_item(
-                    object::Item::new_static(box_mesh.clone())
-                    .at(0.0, 0.0, -10.0)
+                    object::Item::new_spot_light(
+                        object::LightIntensity {
+                            ambient: [0.1, 0.1, 0.1].into(),
+                            diffuse: [1.0, 1.0, 1.0].into(),
+                            specular: [2.0, 2.0, 2.0].into()
+                        },
+                        object::LightFalloff {
+                            constant: 1.0,
+                            linear: 0.09,
+                            quadratic: 0.032
+                        },
+                        m::Deg(12.5).into(),
+                        m::Deg(17.5).into()
+                    )
+                    .rotate([0.0, 1.0, 0.0].into(), m::Deg(180.0))
                 );
 
                 object::Item::new_subdomain(world)
@@ -336,11 +483,33 @@ fn main_loop() -> Result<(), Box<Error>>{
     }
 
     // add light
-    world.add_item(object::Item::new_static_unshaded(box_mesh)
-                                .at(1.2, 1.0, 2.0).scale(0.2));
+    let lights = [m::Vector3::new(0.7, 0.2, 2.0), 
+                  m::Vector3::new(2.3, -3.3, -4.0),
+                  m::Vector3::new(-4.0, 2.0, -12.0),
+                  m::Vector3::new(0.0, 0.0, -3.0)];
+    for pos in lights.iter().cloned() {
+        world.add_item(object::Item::new_static_unshaded(box_mesh.clone())
+                                    .at(pos.x, pos.y, pos.z).scale(0.2));
+        world.add_item(object::Item::new_point_light(
+            object::LightIntensity {
+                ambient: [0.1, 0.1, 0.1].into(),
+                diffuse: [0.5, 0.1, 0.1].into(),
+                specular: [1.0, 0.2, 0.2].into()
+            },
+            object::LightFalloff {
+                constant: 1.0,
+                linear: 0.09,
+                quadratic: 0.032
+            }
+        ).at(pos.x, pos.y, pos.z));
+    }
 
     // rendering abstraction
     let mut renderer = object::RenderContext::new();
+
+    let directional_light_buffer = factory.create_constant_buffer::<DirectionalLight>(256);
+    let point_light_buffer       = factory.create_constant_buffer::<PointLight>(256);
+    let spot_light_buffer        = factory.create_constant_buffer::<SpotLight>(256);
 
 
     // main loop
@@ -392,6 +561,10 @@ fn main_loop() -> Result<(), Box<Error>>{
         let (ref camera_pos, ref camera) = *renderer.cameras.get("cam1").unwrap();
         let projection = (camera.perspective * m::Matrix4::from(camera_pos.rot.invert()) * m::Matrix4::from_translation(-camera_pos.disp)).into();
 
+        // queue lighting data updates
+        encoder.update_buffer(&directional_light_buffer, &renderer.directional_lights, 0)?;
+        encoder.update_buffer(&point_light_buffer, &renderer.point_lights, 0)?;
+        encoder.update_buffer(&spot_light_buffer,  &renderer.spot_lights, 0)?;
 
         // clear the window
         encoder.clear(&render_target, CLEAR_COLOR);
@@ -400,9 +573,15 @@ fn main_loop() -> Result<(), Box<Error>>{
         let (shaded_vertices, slice)   = factory.create_vertex_buffer_with_slice(&renderer.shaded_geometry.0, &renderer.shaded_geometry.1[..]);
         encoder.draw(&slice, &shaded_pso, &shaded_pipeline::Data {
             projection: projection,
-            material: material.clone(),
-            lightcolor: [1.0, 1.0, 1.0],
-            lightpos: [1.2, 1.0, 2.0],
+            material_diffuse:  (diffuse.clone(), sampler.clone()),
+            material_specular: (specular.clone(), sampler.clone()),
+            material_shininess: 32.0,
+            light_directional_count: renderer.directional_lights.len() as i32,
+            light_point_count:       renderer.point_lights.len() as i32,
+            light_spot_count:        renderer.spot_lights.len() as i32,
+            light_directionals:      directional_light_buffer.clone(),
+            light_points:            point_light_buffer.clone(),
+            light_spots:             spot_light_buffer.clone(),
             viewpos: camera_pos.disp.into(),
             vbuf: shaded_vertices,
             out_color: render_target.clone(),

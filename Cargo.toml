@@ -9,6 +9,11 @@ glutin = "0.*"
 gfx_window_glutin = "0.*"
 image = "0.*"
 cgmath = "0.*"
+env_logger = "0.4.0"
 
 [profile.release]
 lto = true
+
+[replace]
+"gfx_device_gl:0.13.0" = { path = "../gfx/src/backend/gl" }
+"gfx_core:0.6.0" = { path = "../gfx/src/core" }

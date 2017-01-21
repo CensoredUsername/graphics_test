@@ -1,11 +1,11 @@
 use cgmath as m;
-use cgmath::{Rotation3, Transform, InnerSpace};
+use cgmath::{Angle, Rotation3, Transform, InnerSpace};
 use glutin::VirtualKeyCode;
 
 use std::collections::{HashSet, HashMap};
 use std::rc::Rc;
 
-use ::Vertex;
+use ::{Vertex, DirectionalLight, PointLight, SpotLight};
 
 
 #[derive(Debug)]
@@ -30,7 +30,10 @@ pub struct RenderContext {
     pub shaded_geometry: (Vec<Vertex>, Vec<u32>),
     pub unshaded_geometry: (Vec<Vertex>, Vec<u32>),
     pub transform_stack: Vec<WorldPos>,
-    pub cameras: HashMap<&'static str, (WorldPos, Camera)>
+    pub cameras: HashMap<&'static str, (WorldPos, Camera)>,
+    pub directional_lights: Vec<DirectionalLight>,
+    pub point_lights: Vec<PointLight>,
+    pub spot_lights: Vec<SpotLight>,
 }
 
 impl RenderContext {
@@ -40,6 +43,9 @@ impl RenderContext {
             unshaded_geometry: (Vec::new(), Vec::new()),
             transform_stack: Vec::new(),
             cameras: HashMap::new(),
+            directional_lights: Vec::new(),
+            point_lights: Vec::new(),
+            spot_lights: Vec::new()
         }
     }
 
@@ -61,7 +67,18 @@ impl RenderContext {
         let (ref mut vertices, ref mut indices) = self.unshaded_geometry;
         vertices.clear();
         indices.clear();
-        self.cameras.clear()
+        self.cameras.clear();
+        self.directional_lights.clear();
+        self.point_lights.clear();
+        self.spot_lights.clear();
+    }
+
+    fn get_pos(&self) -> WorldPos {
+        if let Some(transform) = self.transform_stack.last() {
+            transform.clone()
+        } else {
+            WorldPos::one()
+        }
     }
 
     fn transform_pos(stack: &[WorldPos], pos: m::Point3<f32>) -> m::Point3<f32> {
@@ -115,12 +132,42 @@ impl RenderContext {
         Self::add_vertices(mesh, &mut self.unshaded_geometry, &self.transform_stack);
     }
 
+    pub fn add_directional_light(&mut self, intensity: LightIntensity) {
+        let pos = self.get_pos();
+        self.directional_lights.push(DirectionalLight {
+            direction: pos.transform_vector([0.0, 0.0, 1.0].into()).extend(0.0).into(),
+            ambient: intensity.ambient.extend(0.0).into(),
+            diffuse: intensity.diffuse.extend(0.0).into(),
+            specular: intensity.specular.extend(0.0).into(),
+        });
+    }
+
+    pub fn add_point_light(&mut self, intensity: LightIntensity, falloff: LightFalloff) {
+        let pos = self.get_pos();
+        self.point_lights.push(PointLight {
+            position: pos.disp.extend(0.0).into(),
+            ambient: intensity.ambient.extend(0.0).into(),
+            diffuse: intensity.diffuse.extend(0.0).into(),
+            specular: intensity.specular.extend(0.0).into(),
+            falloff: [falloff.constant, falloff.linear, falloff.quadratic, 0.0]
+        });
+    }
+
+    pub fn add_spot_light(&mut self, intensity: LightIntensity, falloff: LightFalloff, cone: m::Rad<f32>, outercone: m::Rad<f32>) {
+        let pos = self.get_pos();
+        self.spot_lights.push(SpotLight {
+            position: pos.disp.extend(0.0).into(),
+            direction: pos.transform_vector([0.0, 0.0, 1.0].into()).extend(0.0).into(),
+            ambient: intensity.ambient.extend(0.0).into(),
+            diffuse: intensity.diffuse.extend(0.0).into(),
+            specular: intensity.specular.extend(0.0).into(),
+            falloff: [falloff.constant, falloff.linear, falloff.quadratic, 0.0],
+            cone: [cone.cos(), outercone.cos(), 0.0, 0.0]
+        });
+    }
+
     pub fn set_camera(&mut self, camera: Camera) {
-        let pos = if let Some(&pos) = self.transform_stack.last() {
-            pos
-        } else {
-            Transform::one()
-        };
+        let pos = self.get_pos();
         self.cameras.insert(camera.id, (pos, camera));
     }
 }
@@ -169,8 +216,9 @@ pub enum ItemKind {
     Subdomain(World),
     Animation(Box<FnMut(&mut WorldPos, &mut Item, &mut UpdateState)>, Box<Item>),
     Camera(Camera),
-    GlobalLight(m::Vector3<f32>, bool),
-    DirectionalLight(m::Vector3<f32>, m::Rad<f32>, m::Rad<f32>)
+    DirectionalLight(LightIntensity),
+    PointLight(LightIntensity, LightFalloff),
+    SpotLight(LightIntensity, LightFalloff, m::Rad<f32>, m::Rad<f32>)
 }
 
 impl Item {
@@ -222,6 +270,27 @@ impl Item {
         }
     }
 
+    pub fn new_directional_light(intensity: LightIntensity) -> Item {
+        Item {
+            position: WorldPos::one(),
+            kind: ItemKind::DirectionalLight(intensity)
+        }
+    }
+
+    pub fn new_point_light(intensity: LightIntensity, falloff: LightFalloff) -> Item {
+        Item {
+            position: WorldPos::one(),
+            kind: ItemKind::PointLight(intensity, falloff)
+        }
+    }
+
+    pub fn new_spot_light(intensity: LightIntensity, falloff: LightFalloff, cone: m::Rad<f32>, outercone: m::Rad<f32>) -> Item {
+        Item {
+            position: WorldPos::one(),
+            kind: ItemKind::SpotLight(intensity, falloff, cone, outercone)
+        }
+    }
+
     pub fn at(mut self, x: f32, y: f32, z: f32) -> Item {
         self.position.disp = m::Vector3::new(x, y, z);
         self
@@ -247,8 +316,9 @@ impl Item {
             ItemKind::StaticMesh(_) => (),
             ItemKind::StaticUnshadedMesh(_) => (),
             ItemKind::Camera(_) => (),
-            ItemKind::GlobalLight(_, _) => (),
-            ItemKind::DirectionalLight(_, _, _) => (),
+            ItemKind::DirectionalLight(_) => (),
+            ItemKind::PointLight(_, _) => (),
+            ItemKind::SpotLight(_, _, _, _) => (),
             ItemKind::Null => ()
         }
     }
@@ -271,11 +341,14 @@ impl Item {
                 ItemKind::Camera(ref camera) => {
                     ctx.set_camera(camera.clone());
                 },
-                ItemKind::GlobalLight(_, _) => {
-                    unimplemented!();
+                ItemKind::DirectionalLight(ref intensity) => {
+                    ctx.add_directional_light(intensity.clone());
                 },
-                ItemKind::DirectionalLight(_, _, _) => {
-                    unimplemented!();
+                ItemKind::PointLight(ref intensity, falloff) => {
+                    ctx.add_point_light(intensity.clone(), falloff)
+                },
+                ItemKind::SpotLight(ref intensity, falloff, cone, outercone) => {
+                    ctx.add_spot_light(intensity.clone(), falloff, cone, outercone);
                 },
                 ItemKind::Null => ()
             }
@@ -302,4 +375,18 @@ impl<V> Mesh<V> {
 pub struct Camera {
     pub id: &'static str,
     pub perspective: m::Matrix4<f32>
+}
+
+#[derive(Debug, Clone)]
+pub struct LightIntensity {
+    pub ambient: m::Vector3<f32>,
+    pub diffuse: m::Vector3<f32>,
+    pub specular: m::Vector3<f32>
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LightFalloff {
+    pub constant: f32,
+    pub linear: f32,
+    pub quadratic: f32
 }
